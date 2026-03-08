@@ -182,3 +182,79 @@ class CWModel:
         k = np.log(1.0 / m)
         sigma_sq = [self._solve_sigma_sq(k[i], tau[i], v, m_drift, w, eta, rho) for i in range(len(m))]
         return np.sqrt(np.maximum(0, sigma_sq))
+
+    # ==========================================
+    # 5. Bates 模型 (Heston + Jump)
+    # ==========================================
+
+    class BatesModel(HestonModel):
+        """
+        Bates (1996/2000) 跳跃-扩散模型。
+        在 Heston 随机波动率的基础上，加入泊松对数正态跳跃过程以捕捉极端左尾风险。
+        继承 HestonModel 以复用 COS 方法的核心定价逻辑。
+        """
+
+        def __init__(self):
+            super().__init__()
+            # 参数: Heston参数 + Jump参数 [v0, v_bar, kappa, sigma_v, rho, lambda_, mu_J, sigma_J]
+            # lambda_ : 每年跳跃的平均次数 (跳跃强度)
+            # mu_J    : 跳跃幅度的均值 (通常为负，代表左尾暴跌)
+            # sigma_J : 跳跃幅度的波动率
+            self.params = [0.04, 0.04, 2.0, 0.3, -0.7, 0.1, -0.05, 0.1]
+
+        def _char_func_bates(self, u, T, r, v0, v_bar, kappa, sigma_v, rho, lambda_, mu_J, sigma_J):
+            """Bates 模型的特征函数"""
+            # 1. 计算风险中性测度下的跳跃漂移补偿项 (Jump Compensator)
+            omega = lambda_ * (np.exp(mu_J + 0.5 * sigma_J ** 2) - 1)
+
+            # 2. 调用父类 Heston 的特征函数，注意将无风险利率 r 修正为 (r - omega) 以满足无套利条件
+            cf_heston = super()._char_func(u, T, r - omega, v0, v_bar, kappa, sigma_v, rho)
+
+            # 3. 计算纯跳跃过程 (Merton Jump) 的特征函数
+            cf_jump = np.exp(lambda_ * T * (np.exp(1j * u * mu_J - 0.5 * (u * sigma_J) ** 2) - 1))
+
+            # 4. 独立过程的特征函数相乘
+            return cf_heston * cf_jump
+
+        def cos_price_bates(self, S, K, T, r, v0, v_bar, kappa, sigma_v, rho, lambda_, mu_J, sigma_J, N=128):
+            """复写 COS 定价逻辑以使用 Bates 特征函数"""
+            x, k = np.log(S / K), np.arange(N)
+            a, b = -10, 10
+            u = k * np.pi / (b - a)
+            cf = self._char_func_bates(u, T, r, v0, v_bar, kappa, sigma_v, rho, lambda_, mu_J, sigma_J)
+            term = np.exp(1j * k * np.pi * (x - a) / (b - a))
+            return S * np.real(np.sum(cf * term)) / N
+
+        def fit(self, m, tau, iv, S, r):
+            """估计 8 个结构参数：最小化隐含波动率误差 (IVMSE)"""
+
+            def objective(p):
+                v0, v_bar, kappa, sigma_v, rho, lambda_, mu_J, sigma_J = p
+                err = 0
+                for i in range(len(m)):
+                    K = S / m[i]
+                    price = self.cos_price_bates(S, K, tau[i], r, v0, v_bar, kappa, sigma_v, rho, lambda_, mu_J,
+                                                 sigma_J)
+                    # 使用基础的 Newton-Raphson 反解 IV
+                    h_iv = bs_iv(price, S, K, tau[i], r)
+                    err += (iv[i] - h_iv) ** 2
+                return err / len(m)
+
+            # 在 Heston Bounds 的基础上，增加跳跃参数的边界限制
+            # lambda_ \in [0, 5], mu_J \in [-1, 1], sigma_J \in [1e-4, 1]
+            bounds = [(1e-4, 1), (1e-4, 1), (0.1, 10), (1e-4, 1), (-0.99, 0.99),
+                      (0.0, 5.0), (-1.0, 1.0), (1e-4, 1.0)]
+
+            res = minimize(objective, self.params, bounds=bounds)
+            self.params = res.x
+            return self
+
+        def predict(self, m, tau, S, r):
+            """Bates 模型的预测逻辑"""
+            v0, v_bar, kappa, sigma_v, rho, lambda_, mu_J, sigma_J = self.params
+            preds = []
+            for i in range(len(m)):
+                K = S / m[i]
+                price = self.cos_price_bates(S, K, tau[i], r, v0, v_bar, kappa, sigma_v, rho, lambda_, mu_J, sigma_J)
+                preds.append(bs_iv(price, S, K, tau[i], r))
+            return np.array(preds)
